@@ -199,7 +199,7 @@ func LSPDispatch(r *jsonrpc2.Conn, ctx contextpkg.Context, conn *jsonrpc2.Conn, 
 		var res map[string]interface{}
 
 		fmt.Fprintf(os.Stderr, "<calling %v %v %v>\n", req.ID, req.Method, string(*req.Params))
-		tctx, cancel := contextpkg.WithTimeout(contextpkg.Background(), time.Duration(time.Minute))
+		tctx, cancel := contextpkg.WithTimeout(contextpkg.Background(), time.Duration(time.Second * 20))
 		err := r.Call(tctx, req.Method, req.Params, &res)
 		cancel()
 
