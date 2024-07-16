@@ -41,14 +41,6 @@ type State struct {
 	cancelCodeAction contextpkg.CancelFunc
 }
 
-var Notifications = map[string]bool{
-	"window/logMessage":                true,
-	"initialized":                      true,
-	"textDocument/didOpen":             true,
-	"workspace/didChangeConfiguration": true,
-	"textDocument/didChange":           true,
-}
-
 func main() {
 	client := Client{
 		cmd: exec.Command(os.Args[1]),
@@ -162,7 +154,7 @@ func (*Server) Close() error {
 }
 
 func (s *State) LSPDispatch(ctx contextpkg.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
-	if Notifications[req.Method] {
+	if req.Notif  {
 		if req.Method == "textDocument/didChange" && s.cancelCodeAction != nil {
 			s.cancelCodeAction()
 			s.cancelCodeAction = nil
