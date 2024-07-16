@@ -22,14 +22,22 @@ type Watchers struct {
 	watchers []Watcher `json:"watchers"`
 }
 
+type Client struct {
+	cmd    *exec.Cmd
+	conn   *jsonrpc2.Conn
+	stdin  io.WriteCloser
+	stdout io.ReadCloser
+	state  *State
+}
+
 type Server struct {
-	command string
-	err     error
-	cmd     *exec.Cmd
-	conn    *jsonrpc2.Conn
-	stdin   io.WriteCloser
-	stdout  io.ReadCloser
-	plexer  *Plexer
+	state *State
+	conn  *jsonrpc2.Conn
+}
+
+type State struct {
+	conn             *jsonrpc2.Conn
+	cancelCodeAction contextpkg.CancelFunc
 }
 
 var Notifications = map[string]bool{
@@ -40,132 +48,110 @@ var Notifications = map[string]bool{
 	"textDocument/didChange":           true,
 }
 
-type Plexer struct {
-	conn   *jsonrpc2.Conn
-	server *Server
-}
-
 func main() {
-	server := Server{
-		command: os.Args[1],
+	client := Client{
+		cmd: exec.Command(os.Args[1]),
 	}
 
-	plexer := Plexer{server: &server}
-	server.plexer = &plexer
+	err := client.StartProcess()
 
-	plexer.conn = jsonrpc2.NewConn(
-		contextpkg.Background(),
-		jsonrpc2.NewBufferedStream(&plexer, jsonrpc2.VSCodeObjectCodec{}),
-		&plexer,
-	)
-
-	server.Start()
-
-	if server.err != nil {
-		fmt.Errorf("unable to start process %s\n", server.err)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to start Language server %v\n", err)
 		return
 	}
 
-	<-plexer.conn.DisconnectNotify()
+	server := Server{}
+
+	client.StartConn()
+	server.StartConn()
+
+	client.state = &State{conn: server.conn}
+	server.state = &State{conn: client.conn}
+
+	<-server.conn.DisconnectNotify()
 	fmt.Println("Connection closed")
 
-	server.cmd.Process.Kill()
+	client.cmd.Process.Kill()
 }
 
-func (s *Server) Start() {
-	s.cmd = exec.Command(s.command)
-
-	stdin, err := s.cmd.StdinPipe()
-	if err != nil {
-		s.err = err
-		return
-	}
-	s.stdin = stdin
-
-	stdout, err := s.cmd.StdoutPipe()
-	if err != nil {
-		s.err = err
-		return
-	}
-	s.stdout = stdout
-
-	stderr, err := s.cmd.StderrPipe()
-	if err != nil {
-		s.err = err
-		return
-	}
-
-	go func() {
-		io.Copy(os.Stderr, stderr)
-	}()
-
-	if err := s.cmd.Start(); err != nil {
-		s.err = err
-		return
-	}
-
-	s.conn = jsonrpc2.NewConn(
+func (client *Client) StartConn() {
+	client.conn = jsonrpc2.NewConn(
 		contextpkg.Background(),
-		jsonrpc2.NewBufferedStream(s, jsonrpc2.VSCodeObjectCodec{}),
-		s,
+		jsonrpc2.NewBufferedStream(client, jsonrpc2.VSCodeObjectCodec{}),
+		client,
+	)
+}
+
+func (client *Client) StartProcess() error {
+	stdin, err := client.cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	client.stdin = stdin
+
+	stdout, err := client.cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	client.stdout = stdout
+
+	client.cmd.Stderr = os.Stderr
+
+	if err := client.cmd.Start(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Client) Handle(ctx contextpkg.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
+	c.state.LSPDispatch(ctx, conn, req)
+}
+
+func (c *Client) Read(p []byte) (int, error) {
+	return c.stdout.Read(p)
+}
+
+func (c *Client) Write(p []byte) (int, error) {
+	return c.stdin.Write(p)
+}
+
+func (c *Client) Close() error {
+	return errors.Join(c.stdin.Close(), c.stdout.Close())
+}
+
+func (server *Server) StartConn() {
+	server.conn = jsonrpc2.NewConn(
+		contextpkg.Background(),
+		jsonrpc2.NewBufferedStream(server, jsonrpc2.VSCodeObjectCodec{}),
+		server,
 	)
 }
 
 func (s *Server) Handle(ctx contextpkg.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
-	LSPDispatch(s.plexer.conn, ctx, conn, req)
+	s.state.LSPDispatch(ctx, conn, req)
 }
 
-func (s *Server) Read(p []byte) (int, error) {
-	return s.stdout.Read(p)
-}
-
-func (s *Server) Write(p []byte) (int, error) {
-	return s.stdin.Write(p)
-}
-
-func (s *Server) Close() error {
-	return errors.Join(s.stdin.Close(), s.stdout.Close())
-}
-
-func (p *Plexer) Handle(ctx contextpkg.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
-	LSPDispatch(p.server.conn, ctx, conn, req)
-}
-
-func (*Plexer) Read(p []byte) (int, error) {
+func (*Server) Read(p []byte) (int, error) {
 	return os.Stdin.Read(p)
 }
 
-func (*Plexer) Write(p []byte) (int, error) {
+func (*Server) Write(p []byte) (int, error) {
 	return os.Stdout.Write(p)
 }
 
-func (*Plexer) Close() error {
+func (*Server) Close() error {
 	return errors.Join(os.Stdin.Close(), os.Stdout.Close())
 }
 
-func LSPDispatch(r *jsonrpc2.Conn, ctx contextpkg.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
-	fmt.Fprintf(os.Stderr, "<start %v\n", req.Method)
+func (s *State) LSPDispatch(ctx contextpkg.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
 	if Notifications[req.Method] {
-		fmt.Fprintf(os.Stderr, "<dispatch %v>\n", req.Method)
-		r.Notify(ctx, req.Method, req.Params)
-	} else if req.Method == "workspace/configuration" {
-		var completionItems []interface{}
-
-		fmt.Fprintf(os.Stderr, "<completion %v %v>\n", req.ID, req.Method)
-		err := r.Call(ctx, req.Method, req.Params, &completionItems)
-
-		fmt.Fprintf(os.Stderr, "</completion %v %v %v>\n", req.ID, req.Method, err)
-		if err != nil {
-			err := fmt.Errorf("error forwarding requests: %v", err)
-			conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
-				Code:    jsonrpc2.CodeInternalError,
-				Message: err.Error(),
-			})
-		} else {
-			conn.Reply(ctx, req.ID, completionItems)
+		if req.Method == "textDocument/didChange" && s.cancelCodeAction != nil {
+			s.cancelCodeAction()
+			s.cancelCodeAction = nil
 		}
+		s.conn.Notify(ctx, req.Method, req.Params)
 	} else if req.Method == "client/registerCapability" {
-		var completionItems []interface{}
 		var params protocol.RegistrationParams
 
 		json.Unmarshal(*req.Params, &params)
@@ -174,44 +160,55 @@ func LSPDispatch(r *jsonrpc2.Conn, ctx contextpkg.Context, conn *jsonrpc2.Conn, 
 			if params.Registrations[i].Method == "workspace/didChangeWatchedFiles" {
 				params.Registrations[i].RegisterOptions = Watchers{
 					watchers: []Watcher{
-						Watcher{globPattern: "**/{tailwind,tailwind.config}.{js,cjs,ts,mjs}"},
-						Watcher{globPattern: "**/{package-lock.json,yarn.lock,pnpm-lock.yaml}"},
-						Watcher{globPattern: "**/*.{css,scss,sass,less,pcss}"},
+						{globPattern: "**/{tailwind,tailwind.config}.{js,cjs,ts,mjs}"},
+						{globPattern: "**/{package-lock.json,yarn.lock,pnpm-lock.yaml}"},
+						{globPattern: "**/*.{css,scss,sass,less,pcss}"},
 					},
 				}
 			}
 		}
 
-		fmt.Fprintf(os.Stderr, "<register %v %v %v>\n", req.ID, req.Method, params)
-		err := r.Call(ctx, req.Method, params, &completionItems)
-
-		fmt.Fprintf(os.Stderr, "</register %v %v %v>\n", req.ID, req.Method, err)
-		if err != nil {
-			err := fmt.Errorf("error forwarding requests: %v", err)
-			conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
-				Code:    jsonrpc2.CodeInternalError,
-				Message: err.Error(),
-			})
-		} else {
-			conn.Reply(ctx, req.ID, completionItems)
-		}
+		s.Deliver(ctx, conn, req, &params)
 	} else {
-		var res map[string]interface{}
+		s.Deliver(ctx, conn, req, req.Params)
+	}
+}
 
-		fmt.Fprintf(os.Stderr, "<calling %v %v %v>\n", req.ID, req.Method, string(*req.Params))
-		tctx, cancel := contextpkg.WithTimeout(contextpkg.Background(), time.Duration(time.Second * 20))
-		err := r.Call(tctx, req.Method, req.Params, &res)
-		cancel()
+func (s *State) Deliver(ctx contextpkg.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request, params interface{}) {
+	var res json.RawMessage
+	var completed = make(chan error)
 
-		fmt.Fprintf(os.Stderr, "</calling %v %v %v>\n", req.ID, req.Method, err)
+	tctx, cancel := contextpkg.WithTimeout(ctx, time.Duration(time.Second*20))
+	defer cancel()
+
+	call, err := s.conn.DispatchCall(tctx, req.Method, params)
+
+	if err != nil {
+		ReplyWithError(tctx, conn, req.ID, err)
+	}
+
+	go func() {
+		s.cancelCodeAction = cancel
+		completed <- call.Wait(tctx, &res)
+	}()
+
+	select {
+	case err := <-completed:
 		if err != nil {
-			err := fmt.Errorf("error forwarding requests: %v", err)
-			conn.ReplyWithError(ctx, req.ID, &jsonrpc2.Error{
-				Code:    jsonrpc2.CodeInternalError,
-				Message: err.Error(),
-			})
+			ReplyWithError(ctx, conn, req.ID, err)
 		} else {
 			conn.Reply(ctx, req.ID, res)
 		}
+	case <-tctx.Done():
+		return
 	}
+}
+
+func ReplyWithError(ctx contextpkg.Context, conn *jsonrpc2.Conn, id jsonrpc2.ID, err error) {
+	errf := fmt.Errorf("error forwarding requests: %v", err)
+
+	conn.ReplyWithError(ctx, id, &jsonrpc2.Error{
+		Code:    jsonrpc2.CodeInternalError,
+		Message: errf.Error(),
+	})
 }
