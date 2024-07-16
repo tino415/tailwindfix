@@ -23,11 +23,12 @@ type Watchers struct {
 }
 
 type Client struct {
-	cmd    *exec.Cmd
-	conn   *jsonrpc2.Conn
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	state  *State
+	cmd     *exec.Cmd
+	cmdWait chan error
+	conn    *jsonrpc2.Conn
+	stdin   io.WriteCloser
+	stdout  io.ReadCloser
+	state   *State
 }
 
 type Server struct {
@@ -68,10 +69,20 @@ func main() {
 	client.state = &State{conn: server.conn}
 	server.state = &State{conn: client.conn}
 
-	<-server.conn.DisconnectNotify()
-	fmt.Println("Connection closed")
-
-	client.cmd.Process.Kill()
+	select {
+	case <-server.conn.DisconnectNotify():
+		client.conn.Close()
+		client.cmd.Process.Kill()
+	case <-client.conn.DisconnectNotify():
+		server.conn.Close()
+		client.cmd.Process.Kill()
+	case err := <-client.cmdWait:
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Language server died %v\n", err)
+		}
+		client.conn.Close()
+		server.conn.Close()
+	}
 }
 
 func (client *Client) StartConn() {
@@ -100,6 +111,12 @@ func (client *Client) StartProcess() error {
 	if err := client.cmd.Start(); err != nil {
 		return err
 	}
+
+	client.cmdWait = make(chan error)
+
+	go func() {
+		client.cmdWait <- client.cmd.Wait()
+	}()
 
 	return nil
 }
